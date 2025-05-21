@@ -26,18 +26,32 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# OAuth2 token extractor
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/users/login")
 
-# Signup endpoint
+# --------------------- AUTH HELPERS ---------------------
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+):
+    username = auth.verify_token(token)
+    if not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    user = db.query(models.User).filter(models.User.email == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+# --------------------- AUTH ROUTES ---------------------
 @app.post("/users/signup", response_model=schemas.User)
 def signup_user(user: schemas.SignupRequest, db: Session = Depends(get_db)):
-    db_user = db.query(models.User).filter(models.User.name == user.name).first()
-    if db_user:
+    if db.query(models.User).filter(models.User.name == user.name).first():
         raise HTTPException(status_code=400, detail="Username already registered")
-    
+
     hashed_password = auth.get_password_hash(user.password)
-    
     new_user = models.User(
         name=user.name,
         email=user.email,
@@ -45,18 +59,15 @@ def signup_user(user: schemas.SignupRequest, db: Session = Depends(get_db)):
         phone=user.phone,
         role="customer"
     )
-    
-    for addr in user.addresses:  
-        address = models.Address(street=addr.street, city=addr.city, zip=addr.zip)
-        new_user.addresses.append(address)
+
+    for addr in user.addresses:
+        new_user.addresses.append(models.Address(**addr.dict()))
 
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
     return new_user
 
-
-# Login endpoint
 @app.post("/users/login", response_model=schemas.LoginResponseWithToken)
 def login_for_access_token(
     form_data: OAuth2PasswordRequestForm = Depends(),
@@ -72,7 +83,6 @@ def login_for_access_token(
     access_token = auth.create_access_token(data={"sub": user.email})
     return {"access_token": access_token, "token_type": "bearer", "user": user}
 
-# Reset password (generate link)
 @app.post("/users/reset-password")
 def reset_password(
     request: Request,
@@ -82,35 +92,24 @@ def reset_password(
     user = db.query(models.User).filter(models.User.email == resetpass.email).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
     access_token = auth.create_access_token(data={"sub": user.email})
-    base_url = str(request.base_url)
-    reset_link = f"{base_url}reset-password?token={access_token}"
+    reset_link = f"{request.base_url}reset-password?token={access_token}"
     print("Reset link:", reset_link)
     return {"msg": "Password reset link has been generated"}
 
-# Get current user from token
-async def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    db: Session = Depends(get_db)
-):
-    username = auth.verify_token(token)
-    if username is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    user = db.query(models.User).filter(models.User.email == username).first()
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    return user
+@app.get("/reset-password")
+def verify_reset_password_form(token: str):
+    email = auth.verify_token(token)
+    if not email:
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
+    return {"msg": "Token valid. Show reset password form"}
 
-# Get current user data
+# --------------------- USER ROUTES ---------------------
 @app.post("/users/me", response_model=schemas.User)
-async def read_users_me(current_user: models.User = Depends(get_current_user)):
+def read_users_me(current_user: models.User = Depends(get_current_user)):
     return current_user
 
-# Update user info
 @app.put("/users/{userId}", response_model=schemas.User)
 def update_user_info(
     userId: int = Path(...),
@@ -119,35 +118,29 @@ def update_user_info(
     current_user: models.User = Depends(get_current_user)
 ):
     if current_user.id != userId and current_user.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized to update this user"
-        )
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    user = db.query(models.User).filter(models.User.id == current_user.id).first()
+    user = db.query(models.User).filter(models.User.id == userId).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     user.name = updateInfo.name
     user.phone = updateInfo.phone
+
+    # Clear and update addresses
     user.addresses.clear()
-
     for addr in updateInfo.addresses:
-        user.addresses.append(
-            models.Address(id=userId, street=addr.street, city=addr.city, zip=addr.zip)
-        )
+        user.addresses.append(models.Address(**addr.dict()))
 
+    # Clear and update cart items
     user.cart_items.clear()
-    for carti in updateInfo.cart:
-        user.cart_items.append(
-            models.CartItem(id=userId, product_id=carti.product_id, quantity=carti.quantity)
-        )
+    for cart_item in updateInfo.cart:
+        user.cart_items.append(models.CartItem(product_id=cart_item.product_id, quantity=cart_item.quantity))
 
     db.commit()
     db.refresh(user)
     return user
 
-# Change password
 @app.put("/users/{userId}/reset-password")
 def change_password(
     userId: int = Path(...),
@@ -156,29 +149,16 @@ def change_password(
     current_user: models.User = Depends(get_current_user)
 ):
     if current_user.id != userId and current_user.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized to update this user"
-        )
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    user = db.query(models.User).filter(models.User.id == current_user.id).first()
+    user = db.query(models.User).filter(models.User.id == userId).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     user.hashed_password = auth.get_password_hash(newPassword.password)
     db.commit()
-    db.refresh(user)
     return {"msg": "Password updated successfully"}
 
-# Get user role
 @app.get("/users/{userId}/role", response_model=schemas.UserRole)
-async def get_user_role(current_user_role: models.User = Depends(get_current_user)):
-    return current_user_role
-
-# Password reset form verification
-@app.get("/reset-password")
-async def reset_password_form(token: str):
-    email = auth.verify_token(token)
-    if not email:
-        raise HTTPException(status_code=400, detail="Invalid or expired token")
-    return {"msg": "Token valid. Show reset password form"}
+def get_user_role(current_user: models.User = Depends(get_current_user)):
+    return {"role": current_user.role}

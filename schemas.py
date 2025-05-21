@@ -7,6 +7,9 @@ class AddressBase(BaseModel):
     city: str
     zip: str
 
+    class Config:
+        orm_mode = True
+
 class CartItemBase(BaseModel):
     product_id: int
     quantity: int
